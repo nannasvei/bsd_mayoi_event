@@ -12,7 +12,7 @@ ICONS = BASE / "icons"
 ICON_ITEMS = {i: ICONS / f"item{i}.jpg" for i in range(1, 6)}
 ICON_REWARDS = ICONS / "rewards"
 
-# --- Zasady wymiany (do max_take, nie używamy tu w krokach) ---
+# --- Zasady wymiany ---
 EXCHANGE: Dict[int, Dict] = {
     1: {"items": {}, "ep": 1000},
     2: {"items": {1: 15}, "ep": 2000},
@@ -27,7 +27,7 @@ REWARDS_DEF = [
     ("Limited R Ticket",    3,  0,  0,  0,  40,  30,  40000),
     ("SR Ticket",           2,  0,  0,  0,  40,  30,  35000),
     ("R Ticket",            3,  0, 60, 40,   0,   0,  10000),
-    ("Event Skip Ticket",  20,  0,  0,  0,   5,  15,   2500),
+    ("Event Skip Ticket",  20,  0,  0,  0,   5,   15,   2500),
     ("AP Drink EX",         1,  0,  0,  0,  10,  10,   5000),
     ("Luxury Boiled Tofu", 10,  0,  0,  0,  10,  10,   5000),
     ("Color Boiled Tofu",  20,  0,  0,  0,   5,   5,   3000),
@@ -68,7 +68,7 @@ def img_data_uri(path: Path, size: int = 32) -> str:
 
 def reward_icon_path(name: str) -> Path:
     safe = name.lower().replace(" ", "_")
-    return ICON_REWARDS / f"{safe}.jpg"
+    return ICONS / "rewards" / f"{safe}.jpg"
 
 def fmt_ep(ep: int) -> str:
     return f"{ep:,}".replace(",", " ")
@@ -145,14 +145,8 @@ def load_rewards() -> List[Reward]:
         lst.append(Reward(name, limit, [0, i1, i2, i3, i4, i5], ep))
     return lst
 
-# --- Braki uproszczone (bez wymian, tylko "ile mi brakuje") ---
+# --- Braki prosto: recepta vs magazyn (bez wymian) ---
 def compute_missing_direct(inv: Inventory, reward: Reward, count: int):
-    """
-    Liczymy prosto:
-    - potrzeba = recepta * count
-    - braki = max(0, potrzeba - posiadane)
-    Bez uwzględniania wymian. To odpowiada: "co muszę jeszcze zdobyć / wyfarmić".
-    """
     need_items = [0] * 6
     missing_items = [0] * 6
 
@@ -164,6 +158,115 @@ def compute_missing_direct(inv: Inventory, reward: Reward, count: int):
     missing_ep = max(0, need_ep - inv.ep)
 
     return missing_items, missing_ep, need_items, need_ep
+
+# --- Pełne kroki wymiany z uwzględnieniem magazynu ---
+def generate_exchange_steps(inv: Inventory, reward: Reward, count: int) -> str:
+    """
+    Zwraca HTML z krokami:
+    1. Wymień itemX ×N (jeśli brakuje)
+       - pokazuje co potrzeba niżej (itemY, itemZ, EP)
+       - schodzi niżej tylko, jeśli faktycznie brakuje niższego itemu
+    2. Na końcu: wymień na nagrodę ×count
+    """
+    missing_items, _, need_items, need_ep = compute_missing_direct(inv, reward, count)
+
+    # dostępne itemy do wykorzystania przy rozpisce (mutowane)
+    available = {i: inv.items[i] for i in range(1, 6)}
+    steps: List[str] = []
+    step_no = 1
+
+    def explain_lower(t: int, qty: int, indent_level: int) -> List[str]:
+        """
+        Rozpisuje: ile potrzeba itemów niższego poziomu + EP,
+        schodząc niżej tylko jeśli faktycznie czegoś brakuje.
+        """
+        lines: List[str] = []
+        indent = "&nbsp;" * (4 * indent_level)
+
+        recipe = EXCHANGE[t]
+        ep_cost = recipe["ep"] * qty
+        if recipe["items"]:
+            lines.append(f"{indent}- Do wytworzenia {qty}× item{t} potrzeba:")
+        else:
+            lines.append(f"{indent}- Do wytworzenia {qty}× item{t}:")
+
+        # niższe itemy
+        for low, amt in recipe["items"].items():
+            req = qty * amt
+            have = available.get(low, 0)
+            deficit = max(0, req - have)
+            # "rezerwujemy" z magazynu
+            available[low] = max(0, have - req)
+
+            icon_low = img_data_uri(ICON_ITEMS[low], size=18)
+            base = f"{req}× item{low}"
+            if icon_low:
+                base = f"<img src='{icon_low}' width='18'> {base}"
+
+            if deficit <= 0:
+                # wszystko mamy, nie schodzimy niżej
+                lines.append(f"{indent}&nbsp;&nbsp;• {base} (masz w magazynie)")
+            else:
+                # brakuje -> schodzimy poziom niżej
+                if low == 1:
+                    ep_for_item1 = deficit * EXCHANGE[1]["ep"]
+                    lines.append(
+                        f"{indent}&nbsp;&nbsp;• {base} (brakuje {deficit}×) → "
+                        f"wymień EP na {deficit}× item1 (koszt {fmt_ep(ep_for_item1)} EP)"
+                    )
+                else:
+                    lines.append(
+                        f"{indent}&nbsp;&nbsp;• {base} (brakuje {deficit}×) → uzyskaj:"
+                    )
+                    lines.extend(explain_lower(low, deficit, indent_level + 2))
+
+        # koszt EP na samą wymianę item t (nie schodzimy niżej, EP to koniec)
+        if ep_cost > 0:
+            lines.append(
+                f"{indent}&nbsp;&nbsp;• dodatkowo {fmt_ep(ep_cost)} EP na wymianę item{t}"
+            )
+
+        return lines
+
+    # Krok po kroku dla brakujących itemów (5 → 2)
+    for t in range(5, 1, -1):
+        qty_missing = missing_items[t]
+        if qty_missing <= 0:
+            continue
+
+        icon_t = img_data_uri(ICON_ITEMS[t], size=20)
+        label = f"item{t}"
+        if icon_t:
+            label = f"<img src='{icon_t}' width='20'> {label}"
+
+        # główny krok dla tego poziomu
+        steps.append(f"{step_no}. Wymień {label} ×{qty_missing}")
+        # rozpiska niżej (tylko jeśli coś faktycznie brakuje niżej)
+        sub_lines = explain_lower(t, qty_missing, indent_level=1)
+        steps.extend(sub_lines)
+        step_no += 1
+
+    # jeśli nic nie brakowało na poziomach 2–5, a brakuje tylko item1 / EP:
+    if all(missing_items[2:6]) == 0 and (missing_items[1] > 0):
+        icon1 = img_data_uri(ICON_ITEMS[1], size=20)
+        label1 = "item1"
+        if icon1:
+            label1 = f"<img src='{icon1}' width='20'> {label1}"
+        ep_cost = missing_items[1] * EXCHANGE[1]["ep"]
+        steps.append(
+            f"{step_no}. Wymień EP na {label1} ×{missing_items[1]} "
+            f"(koszt {fmt_ep(ep_cost)} EP)"
+        )
+        step_no += 1
+
+    # krok końcowy: wymiana na nagrodę
+    icon_r = img_data_uri(reward_icon_path(reward.name), size=22)
+    label_r = escape(reward.name)
+    if icon_r:
+        label_r = f"<img src='{icon_r}' width='22'> {label_r}"
+    steps.append(f"{step_no}. Wymień na {label_r} ×{count}")
+
+    return "<br>".join(steps)
 
 # --- UI ---
 def main():
@@ -268,8 +371,8 @@ def main():
 
     st.markdown("".join(html), unsafe_allow_html=True)
 
-    # --- Sekcja odbioru i braków ---
-    st.subheader("Odbierz nagrodę i zobacz braki")
+    # --- Sekcja odbioru / kroków wymiany ---
+    st.subheader("Odbierz nagrodę / kroki wymiany")
 
     reward_names = [r.name for r in rewards]
     selected_name = st.selectbox("Wybierz nagrodę", reward_names)
@@ -280,6 +383,7 @@ def main():
     if max_n_for_inv == 0:
         st.info("Na razie nie stać Cię na żadną sztukę tej nagrody (z uwzględnieniem wymian).")
 
+    # pozwalamy wybrać do limitu nagrody; jeżeli ktoś poda więcej niż 'Maks', kroki mogą nie mieć sensu
     count = st.number_input(
         "Ile chcesz odebrać?",
         min_value=1,
@@ -288,7 +392,7 @@ def main():
         value=1,
     )
 
-    # Recepta graficzna (ile trzeba ogółem na count)
+    # Recepta graficzna
     st.markdown("### Recepta na tę ilość (bez wymian):")
     rec_parts = []
     for i in range(1, 6):
@@ -304,38 +408,10 @@ def main():
     rec_parts.append(f"⭐ {fmt_ep(selected_reward.ep * count)} EP")
     st.markdown(" ".join(rec_parts), unsafe_allow_html=True)
 
-    if st.button("Pokaż braki (bez wymian)"):
-        missing_items, missing_ep, need_items, need_ep = compute_missing_direct(
-            new_inv, selected_reward, count
-        )
-
-        st.markdown("### 🔧 Brakuje (patrząc tylko na receptę, bez wymian):")
-
-        anything_missing = any(missing_items[1:]) or missing_ep > 0
-
-        if not anything_missing:
-            st.info("Masz już wszystkie wymagane przedmioty i EP na tę ilość nagrody.")
-        else:
-            lines = []
-            for i in range(1, 6):
-                if missing_items[i] > 0:
-                    icon_uri = img_data_uri(ICON_ITEMS[i], size=20)
-                    text = f"{missing_items[i]}× item{i}"
-                    if icon_uri:
-                        lines.append(f"• <img src='{icon_uri}' width='20'> {text}")
-                    else:
-                        lines.append(f"• {text}")
-            if missing_ep > 0:
-                lines.append(f"• ⭐ {fmt_ep(missing_ep)} EP")
-
-            st.markdown("<br>".join(lines), unsafe_allow_html=True)
-
-            st.markdown("### 🔄 Uproszczone kroki:")
-            st.markdown(
-                "- Zdobądź brakujące itemy (item1..item5) w dowolny sposób (drop, sklep, wymiany)\n"
-                "- Zdobądź brakujące EP (farmienie / wymiany)\n"
-                "- Gdy wszystko będzie na zero, możesz odebrać nagrodę"
-            )
+    if st.button("Pokaż kroki wymiany (z magazynem)"):
+        steps_html = generate_exchange_steps(new_inv, selected_reward, count)
+        st.markdown("### 🔄 Kroki wymiany (uwzględniając Twój magazyn):")
+        st.markdown(steps_html, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
