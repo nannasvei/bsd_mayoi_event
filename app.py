@@ -12,7 +12,7 @@ ICONS = BASE / "icons"
 ICON_ITEMS = {i: ICONS / f"item{i}.jpg" for i in range(1, 6)}
 ICON_REWARDS = ICONS / "rewards"
 
-# --- Zasady wymiany ---
+# --- Zasady wymiany (do max_take, nie używamy tu w krokach) ---
 EXCHANGE: Dict[int, Dict] = {
     1: {"items": {}, "ep": 1000},
     2: {"items": {1: 15}, "ep": 2000},
@@ -73,7 +73,7 @@ def reward_icon_path(name: str) -> Path:
 def fmt_ep(ep: int) -> str:
     return f"{ep:,}".replace(",", " ")
 
-# --- Logika ---
+# --- Logika max ---
 def can_make(n: int, inv: Inventory, r: Reward) -> bool:
     if n <= 0:
         return True
@@ -121,6 +121,7 @@ def max_take(inv: Inventory, r: Reward) -> int:
             hi = m - 1
     return lo
 
+# --- Stan ---
 def load_state() -> Inventory:
     if not STATE_FILE.exists():
         return Inventory(0, [0, 0, 0, 0, 0, 0])
@@ -135,15 +136,34 @@ def load_state() -> Inventory:
 def save_state(inv: Inventory) -> None:
     STATE_FILE.write_text(
         json.dumps({"ep": inv.ep, "items": inv.items}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+        encoding="utf-8"
     )
 
 def load_rewards() -> List[Reward]:
     lst: List[Reward] = []
     for name, limit, i1, i2, i3, i4, i5, ep in REWARDS_DEF:
         lst.append(Reward(name, limit, [0, i1, i2, i3, i4, i5], ep))
-        # index 0 nieużywany, 1..5 to itemy
     return lst
+
+# --- Braki uproszczone (bez wymian, tylko "ile mi brakuje") ---
+def compute_missing_direct(inv: Inventory, reward: Reward, count: int):
+    """
+    Liczymy prosto:
+    - potrzeba = recepta * count
+    - braki = max(0, potrzeba - posiadane)
+    Bez uwzględniania wymian. To odpowiada: "co muszę jeszcze zdobyć / wyfarmić".
+    """
+    need_items = [0] * 6
+    missing_items = [0] * 6
+
+    for i in range(1, 6):
+        need_items[i] = reward.items[i] * count
+        missing_items[i] = max(0, need_items[i] - inv.items[i])
+
+    need_ep = reward.ep * count
+    missing_ep = max(0, need_ep - inv.ep)
+
+    return missing_items, missing_ep, need_items, need_ep
 
 # --- UI ---
 def main():
@@ -212,7 +232,6 @@ def main():
     html.append("<th>Ikona</th>")
     html.append("<th>Nazwa</th>")
     html.append("<th>Limit</th>")
-    # nagłówki itemów jako ikonki
     for i in range(1, 6):
         uri = item_headers_img[i]
         if uri:
@@ -229,11 +248,9 @@ def main():
     for r in rewards:
         max_n = max_take(new_inv, r)
         can_sym = "✅" if max_n > 0 else "❌"
-
         icon_uri = img_data_uri(reward_icon_path(r.name), size=32)
 
         html.append("<tr>")
-        # ikona nagrody
         if icon_uri:
             html.append(f"<td><img src='{icon_uri}' width='32'></td>")
         else:
@@ -243,13 +260,82 @@ def main():
         html.append(f"<td>{r.limit}</td>")
         for i in range(1, 6):
             html.append(f"<td>×{r.items[i]}</td>")
-        html.append(f"<td>{escape(fmt_ep(r.ep))}</td>")
+        html.append(f"<td>{fmt_ep(r.ep)}</td>")
         html.append(f"<td>{can_sym}</td>")
         html.append(f"<td>{max_n}</td>")
         html.append("</tr>")
     html.append("</tbody></table>")
 
     st.markdown("".join(html), unsafe_allow_html=True)
+
+    # --- Sekcja odbioru i braków ---
+    st.subheader("Odbierz nagrodę i zobacz braki")
+
+    reward_names = [r.name for r in rewards]
+    selected_name = st.selectbox("Wybierz nagrodę", reward_names)
+
+    selected_reward = next(r for r in rewards if r.name == selected_name)
+
+    max_n_for_inv = max_take(new_inv, selected_reward)
+    if max_n_for_inv == 0:
+        st.info("Na razie nie stać Cię na żadną sztukę tej nagrody (z uwzględnieniem wymian).")
+
+    count = st.number_input(
+        "Ile chcesz odebrać?",
+        min_value=1,
+        max_value=selected_reward.limit,
+        step=1,
+        value=1,
+    )
+
+    # Recepta graficzna (ile trzeba ogółem na count)
+    st.markdown("### Recepta na tę ilość (bez wymian):")
+    rec_parts = []
+    for i in range(1, 6):
+        if selected_reward.items[i] > 0:
+            icon_uri = img_data_uri(ICON_ITEMS[i], size=24)
+            qty = selected_reward.items[i] * count
+            if icon_uri:
+                rec_parts.append(
+                    f"<img src='{icon_uri}' width='24'> ×{qty}"
+                )
+            else:
+                rec_parts.append(f"item{i} ×{qty}")
+    rec_parts.append(f"⭐ {fmt_ep(selected_reward.ep * count)} EP")
+    st.markdown(" ".join(rec_parts), unsafe_allow_html=True)
+
+    if st.button("Pokaż braki (bez wymian)"):
+        missing_items, missing_ep, need_items, need_ep = compute_missing_direct(
+            new_inv, selected_reward, count
+        )
+
+        st.markdown("### 🔧 Brakuje (patrząc tylko na receptę, bez wymian):")
+
+        anything_missing = any(missing_items[1:]) or missing_ep > 0
+
+        if not anything_missing:
+            st.info("Masz już wszystkie wymagane przedmioty i EP na tę ilość nagrody.")
+        else:
+            lines = []
+            for i in range(1, 6):
+                if missing_items[i] > 0:
+                    icon_uri = img_data_uri(ICON_ITEMS[i], size=20)
+                    text = f"{missing_items[i]}× item{i}"
+                    if icon_uri:
+                        lines.append(f"• <img src='{icon_uri}' width='20'> {text}")
+                    else:
+                        lines.append(f"• {text}")
+            if missing_ep > 0:
+                lines.append(f"• ⭐ {fmt_ep(missing_ep)} EP")
+
+            st.markdown("<br>".join(lines), unsafe_allow_html=True)
+
+            st.markdown("### 🔄 Uproszczone kroki:")
+            st.markdown(
+                "- Zdobądź brakujące itemy (item1..item5) w dowolny sposób (drop, sklep, wymiany)\n"
+                "- Zdobądź brakujące EP (farmienie / wymiany)\n"
+                "- Gdy wszystko będzie na zero, możesz odebrać nagrodę"
+            )
 
 if __name__ == "__main__":
     main()
